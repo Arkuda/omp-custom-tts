@@ -55,9 +55,9 @@ def markdown_text(text):
         if token.type != "inline" or in_table:
             continue
         block = URL.sub("", "".join(
-            child.content if child.type == "text" else " "
+            child.content if child.type in ("text", "code_inline") else " "
             for child in token.children or ()
-            if child.type in ("text", "softbreak", "hardbreak")
+            if child.type in ("text", "code_inline", "softbreak", "hardbreak")
         )).strip()
         if RUSSIAN.search(block):
             blocks.append(block)

@@ -3,5 +3,5 @@
   "version": "0.1.0",
   "type": "module",
   "omp": { "extensions": ["./index.ts"] },
-  "files": ["index.ts", "src", "kokoro_ru.py", "setup.ps1", "setup.sh", "requirements.txt"]
+  "files": ["index.ts", "src", "kokoro_ru.py", "kokoro_daemon.py", "setup.ps1", "setup.sh", "requirements.txt"]
 }

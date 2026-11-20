@@ -1,0 +1,7 @@
+{
+  "name": "omp-kokoro-ru",
+  "version": "0.1.0",
+  "type": "module",
+  "omp": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "src", "kokoro_ru.py", "setup.ps1", "setup.sh", "requirements.txt"]
+}

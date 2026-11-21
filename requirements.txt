@@ -10,5 +10,6 @@ transformers==4.57.6
 sentencepiece==0.2.2
 razdel==0.5.0
 markdown-it-py==4.0.0
+sounddevice==0.5.5
 python-crfsuite==0.9.10 ; sys_platform == "darwin" and platform_machine == "x86_64"
 python-crfsuite==0.9.12 ; sys_platform != "darwin" or platform_machine != "x86_64"

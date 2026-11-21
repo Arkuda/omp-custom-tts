@@ -11,13 +11,14 @@ import sys
 import tempfile
 from contextlib import contextmanager, suppress
 
+from kokoro_ru import frame
+
 IDLE_SECONDS = 300
 SYNTHESIS_SECONDS = 300
 LINE_LIMIT = 128 * 1024
 ENDPOINT = "daemon-v1.json"
 WORKER = Path(__file__).with_name("kokoro_ru.py")
 BUSY = "Kokoro-ru: другой запрос уже выполняется"
-WINSOUND = "import sys, winsound; winsound.PlaySound(sys.argv[1], winsound.SND_FILENAME | winsound.SND_NODEFAULT)"
 WINDOWS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
@@ -37,10 +38,6 @@ def daemon_lock(root):
         else:
             # The kernel releases the lock on close, including on process death.
             yield True
-
-
-def frame(value):
-    return json.dumps(value, ensure_ascii=True).encode("ascii") + b"\n"
 
 
 def proof(key, role, nonce):
@@ -78,6 +75,47 @@ async def until_cancelled(awaitable, disconnect, timeout=None):
         await asyncio.gather(work, return_exceptions=True)
 
 
+class PlaybackError(RuntimeError):
+    pass
+
+
+class Playback:
+    def __init__(self):
+        self.process = None
+        self.diagnostics = None
+
+    async def write(self, pcm):
+        try:
+            if self.process is None:
+                self.process = await asyncio.create_subprocess_exec(
+                    sys.executable, "-X", "utf8", str(WORKER), "play",
+                    stdin=asyncio.subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+                    creationflags=WINDOWS_FLAGS,
+                )
+                self.diagnostics = asyncio.create_task(self.process.stderr.read())
+            self.process.stdin.write(pcm)
+            await self.process.stdin.drain()
+        except OSError as error:
+            if isinstance(error, BrokenPipeError | ConnectionResetError) and self.process is not None:
+                await self.wait_for_exit()
+            raise PlaybackError(f"Kokoro-ru: ошибка проигрывания: {error or 'канал PCM закрыт'}") from error
+
+    async def wait_for_exit(self):
+        status = await self.process.wait()
+        if status:
+            detail = (await self.diagnostics).decode("utf-8", errors="replace").strip()
+            raise PlaybackError(f"Kokoro-ru: ошибка проигрывания: {detail or f'код {status}'}")
+
+    async def finish(self):
+        self.process.stdin.close()
+        await self.wait_for_exit()
+
+    async def close(self):
+        if self.process is not None:
+            await terminate(self.process)
+            await self.diagnostics
+
+
 class Daemon:
     def __init__(self, root, idle_seconds):
         self.root = root
@@ -101,17 +139,33 @@ class Daemon:
 
     async def stop_worker(self):
         if self.worker is not None:
-            await terminate(self.worker)
-            await self.diagnostics
+            async def discard_output():
+                # A cancelled stream can leave stdout paused at its buffer limit.
+                while await self.worker.stdout.read(8192):
+                    pass
+
+            await asyncio.gather(terminate(self.worker), discard_output(), self.diagnostics)
             self.worker = None
             self.diagnostics = None
 
-    async def ask_worker(self, request):
+    async def ask_worker(self, request, playback):
         self.worker.stdin.write(frame(request))
         await self.worker.stdin.drain()
-        return await self.worker.stdout.readline()
+        if playback is None:
+            return json.loads(await self.worker.stdout.readline())
+        while True:
+            # Time the next model frame, not time spent draining the audio device.
+            async with asyncio.timeout(SYNTHESIS_SECONDS):
+                reply = json.loads(await self.worker.stdout.readline())
+                if not isinstance(reply, dict) or "pcm" not in reply:
+                    return reply
+                size = reply["pcm"]
+                if type(size) is not int or size <= 0 or size % 2:
+                    raise ValueError("invalid PCM frame size")
+                pcm = await self.worker.stdout.readexactly(size)
+            await playback.write(pcm)
 
-    async def synthesize(self, request, disconnect):
+    async def synthesize(self, request, disconnect, playback=None):
         if disconnect.done():
             raise RequestCancelled
         if self.worker is None or self.worker.returncode is not None:
@@ -126,41 +180,29 @@ class Daemon:
         try:
             if disconnect.done():
                 raise RequestCancelled
-            reply = json.loads(await until_cancelled(self.ask_worker(request), disconnect, SYNTHESIS_SECONDS))
+            reply = await until_cancelled(
+                self.ask_worker(request, playback), disconnect,
+                SYNTHESIS_SECONDS if playback is None else None,
+            )
             if not isinstance(reply, dict) or not (
                 (reply.get("ok") is True and (
-                    type(reply.get("bytes")) is int and reply["bytes"] > 0
-                    or request["format"] == "markdown" and reply.get("skipped") is True
+                    (playback is None and type(reply.get("bytes")) is int and reply["bytes"] > 0)
+                    or (playback is not None and playback.process is not None and reply.get("streamed") is True)
+                    or (request["format"] == "markdown" and reply.get("skipped") is True)
                 )) or (reply.get("ok") is False and isinstance(reply.get("error"), str))
             ):
                 raise ValueError("invalid worker reply")
-        except (RequestCancelled, asyncio.CancelledError):
+        except (RequestCancelled, asyncio.CancelledError, PlaybackError):
             await self.stop_worker()
             raise
         except TimeoutError:
             await self.stop_worker()
             raise RuntimeError("Kokoro-ru: таймаут синтеза (300 с)") from None
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, asyncio.IncompleteReadError) as error:
             await self.stop_worker()
             tail = self.tail.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"Kokoro-ru: ошибка Python worker: {tail or error}") from error
         return reply
-
-    async def play(self, path, disconnect):
-        args = [sys.executable, "-X", "utf8", "-c", WINSOUND, str(path)] if os.name == "nt" else ["/usr/bin/afplay", str(path)]
-        try:
-            player = await asyncio.create_subprocess_exec(
-                *args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=WINDOWS_FLAGS,
-            )
-            try:
-                status = await until_cancelled(player.wait(), disconnect)
-            finally:
-                await terminate(player)
-        except OSError as error:
-            raise RuntimeError(f"Kokoro-ru: ошибка проигрывания: {error}") from error
-        if status:
-            raise RuntimeError(f"Kokoro-ru: ошибка проигрывания (код {status})")
 
     async def run(self, request, disconnect):
         kind, text, voice = request.get("kind"), request.get("text"), request.get("voice")
@@ -178,21 +220,26 @@ class Daemon:
         self.active = True
         self.idle.cancel()
         try:
-            with tempfile.TemporaryDirectory(prefix="omp-kokoro-ru-", dir=target.parent if target else None) as temp:
+            synthesis = {"text": text, "voice": voice, "format": "markdown" if kind == "auto" else "plain"}
+            if target is None:
+                playback = Playback()
+                try:
+                    reply = await self.synthesize(synthesis, disconnect, playback)
+                    if "streamed" not in reply:
+                        return reply
+                    await until_cancelled(playback.finish(), disconnect)
+                    return {"ok": True, "played": True}
+                finally:
+                    await playback.close()
+
+            with tempfile.TemporaryDirectory(prefix="omp-kokoro-ru-", dir=target.parent) as temp:
                 wav = Path(temp) / "speech.wav"
-                reply = await self.synthesize({
-                    "text": text, "voice": voice, "format": "markdown" if kind == "auto" else "plain",
-                    "output_path": str(wav),
-                }, disconnect)
-                if "bytes" not in reply:
-                    return reply
-                if disconnect.done():
-                    raise RequestCancelled
-                if target is not None:
+                reply = await self.synthesize({**synthesis, "output_path": str(wav)}, disconnect)
+                if "bytes" in reply:
+                    if disconnect.done():
+                        raise RequestCancelled
                     wav.replace(target)
-                    return reply
-                await self.play(wav, disconnect)
-                return {"ok": True, "played": True}
+                return reply
         except RequestCancelled:
             return {"ok": True, "skipped": True}
         except (OSError, RuntimeError, ValueError) as error:

@@ -8,7 +8,14 @@ import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-export type VoiceId = "sveta" | "masha" | "dima";
+export const VOICES = ["sveta", "masha", "dima"] as const;
+export type VoiceId = typeof VOICES[number];
+export const DEFAULT_VOICE: VoiceId = "sveta";
+
+export function isVoice(voice: string): voice is VoiceId {
+  return (VOICES as readonly string[]).includes(voice);
+}
+
 type PlayKind = "manual" | "auto";
 type JobKind = PlayKind | "save";
 type Job = { kind: JobKind; controller: AbortController; done?: Promise<unknown> };

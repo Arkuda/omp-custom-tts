@@ -1,9 +1,8 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import { resolve } from "node:path";
-import { KokoroRuntime, type VoiceId } from "./src/runtime.ts";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { join, resolve } from "node:path";
+import { DEFAULT_SETTINGS, readSettings, SETTINGS_FILE, writeSettings, type SpeechSettings } from "./src/settings.ts";
+import { isVoice, KokoroRuntime, VOICES, type VoiceId } from "./src/runtime.ts";
 
-const VOICES = ["sveta", "masha", "dima"] as const;
-const DEFAULT_VOICE = "sveta";
 const VOICE_LABELS: Record<VoiceId, string> = {
   sveta: "Света — женский",
   masha: "Маша — женский",
@@ -26,7 +25,6 @@ type Candidate = { key: ReplyKey; text: string };
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function validText(text: string): boolean { return text.length <= TEXT_LIMIT && text.trim().length > 0; }
-function isVoice(voice: string): voice is VoiceId { return VOICES.some(id => id === voice); }
 
 function parseSay(args: string, selectedVoice: VoiceId): { text: string; voice: VoiceId } {
   const input = args.trimStart();
@@ -62,14 +60,37 @@ function limitSpeech(text: string): string {
 export default function activate(pi: ExtensionAPI): void {
   const runtime = new KokoroRuntime();
   const { z } = pi.zod;
-  let auto = false;
-  let selectedVoice: VoiceId = DEFAULT_VOICE;
+  let auto = DEFAULT_SETTINGS.auto;
+  let selectedVoice: VoiceId = DEFAULT_SETTINGS.voice;
   let fresh: ReplyKey | undefined;
   let candidate: Candidate | undefined;
 
   const clearReply = () => {
     fresh = undefined;
     candidate = undefined;
+  };
+
+  // Автоозвучка и голос — глобальные настройки в каталоге агента: они переживают
+  // смену сессии и перезапуск OMP. Путь ленивый, чтобы не трогать каталог агента
+  // до первого обращения к настройкам.
+  const loadSettings = async (ctx: ExtensionContext): Promise<void> => {
+    let settings: SpeechSettings;
+    try {
+      settings = await readSettings(join(pi.pi.getAgentDir(), SETTINGS_FILE));
+    } catch (error) {
+      settings = DEFAULT_SETTINGS;
+      ctx.ui.notify(`${errorText(error)} — применены значения по умолчанию`, "warning");
+    }
+    auto = settings.auto;
+    selectedVoice = settings.voice;
+  };
+
+  const saveSettings = async (ctx: ExtensionContext): Promise<void> => {
+    try {
+      await writeSettings(join(pi.pi.getAgentDir(), SETTINGS_FILE), { auto, voice: selectedVoice });
+    } catch (error) {
+      ctx.ui.notify(`Kokoro-ru: в текущей сессии применено, но не сохранено: ${errorText(error)}`, "error");
+    }
   };
 
   pi.registerCommand("say-ru", {
@@ -131,6 +152,7 @@ export default function activate(pi: ExtensionAPI): void {
           }
           if (!choice || !isVoice(choice)) throw new Error("Использование: /speech-ru voice sveta|masha|dima");
           selectedVoice = choice;
+          await saveSettings(ctx);
           ctx.ui.notify(`Kokoro-ru: голос ${selectedVoice} (${VOICE_LABELS[selectedVoice]})`, "info");
           return;
         }
@@ -139,11 +161,13 @@ export default function activate(pi: ExtensionAPI): void {
             if (ctx.mode !== "tui") throw new Error("Kokoro-ru: автоозвучка доступна только в интерактивном OMP");
             runtime.assertReady();
             auto = true;
+            await saveSettings(ctx);
             break;
           case "off":
             auto = false;
             candidate = undefined;
             runtime.stop("auto");
+            await saveSettings(ctx);
             break;
           case "status":
           case "":
@@ -230,11 +254,15 @@ export default function activate(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("session_switch", () => {
-    auto = false;
-    selectedVoice = DEFAULT_VOICE;
+  pi.on("session_start", async (_event, ctx) => {
+    await loadSettings(ctx);
+  });
+  pi.on("session_switch", async (_event, ctx) => {
+    // Голос и автоозвучка — глобальные настройки: перечитываем файл вместо сброса
+    // на дефолты. Останавливается только активный синтез прошлой сессии.
     clearReply();
     runtime.reset();
+    await loadSettings(ctx);
   });
   pi.on("session_clear", () => {
     clearReply();
